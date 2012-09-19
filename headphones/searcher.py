@@ -15,6 +15,7 @@
 
 import urllib, urllib2, urlparse
 import lib.feedparser as feedparser
+import lib.whatapi as whatapi
 from xml.dom import minidom
 from xml.parsers.expat import ExpatError
 from StringIO import StringIO
@@ -97,7 +98,7 @@ def searchforalbum(albumid=None, new=False, lossless=False):
                 else:
                     foundNZB = searchNZB(result['AlbumID'], new)
 
-            if (headphones.KAT or headphones.ISOHUNT or headphones.MININOVA or headphones.WAFFLES) and foundNZB == "none":
+            if (headphones.KAT or headphones.ISOHUNT or headphones.MININOVA or headphones.WAFFLES or headphones.WHATCD) and foundNZB == "none":
                 if result['Status'] == "Wanted Lossless":
                     searchTorrent(result['AlbumID'], new, losslessOnly=True)
                 else:
@@ -109,7 +110,7 @@ def searchforalbum(albumid=None, new=False, lossless=False):
         if (headphones.NZBMATRIX or headphones.NEWZNAB or headphones.NZBSORG or headphones.NEWZBIN) and (headphones.SAB_HOST or headphones.BLACKHOLE):
             foundNZB = searchNZB(albumid, new, lossless)
 
-        if (headphones.KAT or headphones.ISOHUNT or headphones.MININOVA or headphones.WAFFLES) and foundNZB == "none":
+        if (headphones.KAT or headphones.ISOHUNT or headphones.MININOVA or headphones.WAFFLES or headphones.WHATCD) and foundNZB == "none":
             searchTorrent(albumid, new, lossless)
 
 def searchNZB(albumid=None, new=False, losslessOnly=False):
@@ -665,6 +666,7 @@ def searchTorrent(albumid=None, new=False, losslessOnly=False):
         logger.info("Searching torrents for %s since it was marked as wanted" % term)
         
         resultlist = []
+        pre_sorted_results = False
         minimumseeders = int(headphones.NUMBEROFSEEDERS) - 1
 
         if headphones.KAT:
@@ -806,7 +808,102 @@ def searchTorrent(albumid=None, new=False, losslessOnly=False):
                         except Exception, e:
                             logger.error(u"An error occurred while trying to parse the response from Waffles.fm: %s" % e)
 
+        if headphones.WHATCD:
+            provider = "What.cd"
+            providerurl = "http://what.cd/"
 
+            bitrate = None
+            if headphones.PREFERRED_QUALITY == 3 or losslessOnly:
+                format_regex = "FLAC"
+                maxsize = 10000000000
+            elif headphones.PREFERRED_QUALITY:
+                format_regex = "(FLAC|MP3)"
+                bitrate = headphones.PREFERRED_BITRATE
+                maxsize = 10000000000
+            else:
+                format_regex = "MP3"
+                maxsize = 300000000
+
+            try:
+                whatcd = whatapi.getWhatcdNetwork(headphones.WHATCD_USERNAME, headphones.WHATCD_PASSWORD)
+            except:
+                whatcd = None
+                logger.warn("What.cd credentials incorrect or site is down.")
+
+            if whatcd:
+                whatcd.enableCaching()
+                logger.info("Getting artist information for %s..." % artistterm)
+                artist = whatcd.getArtist(artistterm)
+                artist_id = artist.getArtistId()
+            else:
+                artist_id = None
+
+            if artist and artist_id: # will be None if artist not found
+                logger.info(u"What.cd artist ID: %s" % artist_id)
+                artist_releases = artist.getArtistReleases()
+                logger.info(u"Found %d releases on %s for %s" % (len(artist_releases), provider, artistterm))
+                #Returns a list with all artist's releases in form of dictionary {releasetype, year, name, id}
+            else:
+                artist_releases = []
+
+            logger.info(u"Loading information about available torrents (this may take a while)")
+            logger.info(u"Collecting individual releases...")
+            release_torrent_groups = [ whatcd.getTorrentGroup(release['id']) for release in artist_releases if albumterm in release['name'] ]
+            logger.info(u"Done gathering torrentgroups.")
+
+
+            all_children = []
+            for group in release_torrent_groups:
+                logger.info(u"Getting individual torrents for parent ID %s" % group.getTorrentParentId())
+                new_children = group.getTorrentChildren()
+                all_children += new_children
+                logger.info(u"Found torrent IDs: %s" % ", ".join(new_children))
+            # cap at 10 matches, 1 per second to reduce hits on API...don't wanna get in trouble.
+            # Might want to turn up number of matches later.
+#            max_torrent_info_reads = 10
+            info_read_rate = 1
+
+            logger.info(u"Gathering torrent objects for IDs.")
+            match_torrents = []
+            for i, child_id in enumerate(all_children):
+                if i > 0:
+                    time.sleep(info_read_rate)
+                torrent_object = whatcd.getTorrent(child_id)
+                match_torrents.append(torrent_object)
+                logger.info(u"Created torrent object for %s" % torrent_object.getTorrentFolderName())
+
+
+            # filter on format, size, and num seeders
+            logger.info(u"Filtering torrents by format, maximum size, and minimum seeders...")
+            match_torrents = [ torrent for torrent in match_torrents if re.search(format_regex, torrent.getTorrentDetails(), flags=re.I) ]
+            match_torrents = [ torrent for torrent in match_torrents if helpers.mb_to_bytes(torrent.getTorrentSize()) <= maxsize ]
+            match_torrents = [ torrent for torrent in match_torrents if int(torrent.getTorrentSeeders()) >= minimumseeders ]
+#            match_torrents = [ torrent for torrent in match_torrents
+#                               if re.search(format_regex, torrent.getTorrentDetails(), flags=re.I)
+#                                and helpers.mb_to_bytes(torrent.getTorrentSize()) <= maxsize
+#                                and int(torrent.getTorrentSeeders()) >= minimumseeders ] #hotspot
+            logger.info(u"Remaining torrents: %s" % ", ".join([torrent.getTorrentFolderName() for torrent in match_torrents]))
+
+            # sort by times d/l'd
+            if not len(match_torrents):
+                logger.info(u"No results found from %s for %s after filtering" % (provider, term))
+            elif len(match_torrents) > 1:
+                logger.info(u"Found %d matching releases from %s for %s - %s after filtering" %
+                            (len(match_torrents), provider, artistterm, albumterm))
+                logger.info("Sorting torrents by times snatched and preferred bitrate %s..." % bitrate)
+                match_torrents.sort(key=lambda x: int(x.getTorrentSnatched()), reverse=True)
+                if bitrate:
+                    match_torrents.sort(key=lambda x: re.match("mp3", x.getTorrentDetails(), flags=re.I), reverse=True)
+                    match_torrents.sort(key=lambda x: str(bitrate) in x.getTorrentFolderName(), reverse=True)
+                logger.info(u"New order: %s" % ", ".join([u"%s - %s snatches" % (torrent.getTorrentFolderName(), torrent.getTorrentSnatched())
+                                                                        for torrent in match_torrents]))
+
+            pre_sorted_results = True
+            for torrent in match_torrents:
+                resultlist.append((torrent.getTorrentFolderName(),
+                                   helpers.mb_to_bytes(torrent.getTorrentSize()),
+                                   providerurl + torrent.getTorrentDownloadURL(),
+                                   provider))
 
         if headphones.ISOHUNT:
             provider = "isoHunt"    
@@ -961,7 +1058,7 @@ def searchTorrent(albumid=None, new=False, losslessOnly=False):
         
         if len(resultlist):    
                        
-            if headphones.PREFERRED_QUALITY == 2 and headphones.PREFERRED_BITRATE:
+            if headphones.PREFERRED_QUALITY == 2 and headphones.PREFERRED_BITRATE and not pre_sorted_results:
 
                 logger.debug('Target bitrate: %s kbps' % headphones.PREFERRED_BITRATE)
 
@@ -987,6 +1084,10 @@ def searchTorrent(albumid=None, new=False, losslessOnly=False):
                     logger.info('No track information for %s - %s. Defaulting to highest quality' % (albums[0], albums[1]))
                     
                     torrentlist = sorted(resultlist, key=lambda title: title[1], reverse=True)
+
+            elif pre_sorted_results:
+
+                torrentlist = resultlist
             
             else:
             
@@ -1013,7 +1114,7 @@ def searchTorrent(albumid=None, new=False, losslessOnly=False):
 
             logger.info(u"Pre-processing result")
             
-            (data, bestqual) = preprocesstorrent(torrentlist)
+            (data, bestqual) = preprocesstorrent(torrentlist, pre_sorted_results)
             
             if data and bestqual:
                 logger.info(u'Found best result from %s: <a href="%s">%s</a> - %s' % (bestqual[3], bestqual[2], bestqual[0], helpers.bytes_to_mb(bestqual[1])))
@@ -1051,13 +1152,16 @@ def searchTorrent(albumid=None, new=False, losslessOnly=False):
                 myDB.action('UPDATE albums SET status = "Snatched" WHERE AlbumID=?', [albums[2]])
                 myDB.action('INSERT INTO snatched VALUES( ?, ?, ?, ?, DATETIME("NOW", "localtime"), ?, ?)', [albums[2], bestqual[0], bestqual[1], bestqual[2], "Snatched", torrent_folder_name])
 
-def preprocesstorrent(resultlist):
+def preprocesstorrent(resultlist, pre_sorted_list=False):
     selresult = ""
-    for result in resultlist:
-        if selresult == "":
-            selresult = result
-        elif int(selresult[1]) < int(result[1]): # if size is lower than new result replace previous selected result (bigger size = better quality?)
-            selresult = result
+    if pre_sorted_list:
+        selresult = resultlist[0]
+    else:
+        for result in resultlist:
+            if selresult == "":
+                selresult = result
+            elif int(selresult[1]) < int(result[1]): # if size is lower than new result replace previous selected result (bigger size = better quality?)
+                selresult = result
             
     try:
         request = urllib2.Request(selresult[2])
